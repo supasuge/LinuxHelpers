@@ -1,6 +1,6 @@
-# LinuxPermissionHelp
+# LinuxHelpers
 
-Useful Python3 scripts for getting  a quick reference of file/directory permissions for mainly begineers but also just generally useful.
+Useful Python3 and bash scripts for getting information such as what aliases you have registered, as well as comprehensive permission quick-reference helpers.
 
 If you choose to use any of these scripts, it's reccomended you place them with your local `$PATH` such as `/usr/local/bin/`
 
