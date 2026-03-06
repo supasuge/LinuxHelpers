@@ -1,0 +1,286 @@
+#!/usr/bin/env python3
+"""
+chmod‑calculator – display permissions, type and attributes of a file
+with a clean tabular output.
+"""
+
+import argparse
+import grp
+import os
+import pwd
+import stat
+import subprocess
+from typing import Dict
+
+# ----------------------------------------------------------------------
+# Helper functions – unchanged logic
+# ----------------------------------------------------------------------
+
+
+def get_permission_bits(mode: int, mask: tuple) -> Dict[str, str]:
+    """Extract permission bits for read, write, execute."""
+    return {
+        "Read": "Yes" if mode & mask[0] else "No",
+        "Write": "Yes" if mode & mask[1] else "No",
+        "Execute": "Yes" if mode & mask[2] else "No",
+    }
+
+
+def check_special_bits(mode: int) -> Dict[str, str]:
+    """Check special bits (SUID, SGID, Sticky Bit)."""
+    return {
+        "SUID": "Set" if mode & stat.S_ISUID else "Not Set",
+        "SGID": "Set" if mode & stat.S_ISGID else "Not Set",
+        "Sticky Bit": "Set" if mode & stat.S_ISVTX else "Not Set",
+    }
+
+
+def calculate_octal(mode: int) -> str:
+    """Calculate octal permissions."""
+    owner = (mode & stat.S_IRWXU) >> 6
+    group = (mode & stat.S_IRWXG) >> 3
+    public = mode & stat.S_IRWXO
+    return f"{owner}{group}{public}"
+
+
+def detect_file_type(file_path: str) -> str:
+    """Detect if the path is a folder, file, symlink, or hardlink."""
+    if os.path.islink(file_path):
+        return "Symlink"
+    if os.path.isdir(file_path):
+        return "Directory"
+    if os.path.isfile(file_path):
+        return "Hardlink" if os.stat(file_path).st_nlink > 1 else "Regular File"
+    return "Other"
+
+
+def has_acl(file_path: str) -> str:
+    """Check if the file has Access Control Lists (ACLs)."""
+    try:
+        result = subprocess.run(
+            ["getfacl", file_path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        lines = result.stdout.splitlines()
+        default_acl = {"user::", "group::", "other::"}
+        for line in lines:
+            if any(line.startswith(entry) for entry in default_acl):
+                continue
+            if ":" in line and not line.startswith("#"):
+                return "yes"
+        return "none"
+    except FileNotFoundError:
+        return "none"
+
+
+def has_xattr(file_path: str) -> str:
+    """Check if the file has extended attributes (xattr)."""
+    try:
+        result = subprocess.run(
+            ["getfattr", "-d", file_path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        return "yes" if result.returncode == 0 and len(result.stdout.splitlines()) > 1 else "none"
+    except FileNotFoundError:
+        return "none"
+
+
+def resolve_symlink(file_path: str) -> str:
+    """Resolve the target of a symlink."""
+    try:
+        if os.path.islink(file_path):
+            target = os.readlink(file_path)
+            real_target = os.path.realpath(file_path)
+            return f"yes, points to: '{target}'\nReal Path: '{real_target}'"
+        return "No"
+    except OSError as e:
+        return f"Error resolving symlink: {e}"
+
+
+def detect_underlying_symlink_folder(file_path: str) -> str:
+    """Check if the file resides in a symlinked folder and resolve it."""
+    parent_path = os.path.dirname(file_path)
+    parts = parent_path.split(os.sep)
+    current_path = os.sep
+    for part in parts:
+        if not part:
+            continue
+        current_path = os.path.join(current_path, part)
+        if os.path.islink(current_path):
+            real_path = os.path.realpath(current_path)
+            return (
+                f"Yes\nParent Folder Symlink Path: '{current_path}'\n"
+                f"Parent Folder Real Path: '{real_path}'"
+            )
+    return "No"
+
+
+def get_capabilities(file_path: str) -> str:
+    """Check if the file has Linux capabilities."""
+    try:
+        result = subprocess.run(
+            ["getcap", file_path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        return result.stdout.strip() if result.stdout else "None"
+    except FileNotFoundError:
+        return "None"
+
+
+def has_immutable(file_path: str) -> str:
+    """Check if the file has the immutable bit set (chattr +i)."""
+    try:
+        result = subprocess.run(
+            ["lsattr", file_path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        return "Yes" if "-i-" in result.stdout else "No"
+    except FileNotFoundError:
+        return "No"
+
+
+# ----------------------------------------------------------------------
+# Presentation helpers – new tabular output
+# ----------------------------------------------------------------------
+
+
+def _print_key_value_table(title: str, data: Dict[str, str]) -> None:
+    """Print a two‑column table for generic key/value pairs."""
+    print(f"\n=== {title} ===")
+    max_key_len = max(len(k) for k in data) + 2
+    for key, value in data.items():
+        print(f"{key:<{max_key_len}}: {value}")
+
+
+def _print_permission_matrix(perm_dict: Dict[str, Dict[str, str]]) -> None:
+    """Print the Owner/Group/Public permission matrix."""
+    print("\n=== Permission Matrix ===")
+    header = f"{'Category':<12} {'Read':<6} {'Write':<6} {'Execute':<8}"
+    print(header)
+    print("-" * len(header))
+    for category, perms in perm_dict.items():
+        print(
+            f"{category:<12} {perms['Read']:<6} {perms['Write']:<6} {perms['Execute']:<8}"
+        )
+
+
+def _print_special_bits(special: Dict[str, str]) -> None:
+    """Print the three special bits."""
+    print("\n=== Special Bits ===")
+    for bit, status in special.items():
+        print(f"{bit:<12}: {status}")
+
+
+# ----------------------------------------------------------------------
+# Core display routine – now uses the helpers above
+# ----------------------------------------------------------------------
+
+
+def display_permissions(file_path: str) -> None:
+    """Gather information about *file_path* and render it as tables."""
+    try:
+        file_stats = os.lstat(file_path)
+
+        # Basic metadata -------------------------------------------------
+        file_type = detect_file_type(file_path)
+        owner = pwd.getpwuid(file_stats.st_uid).pw_name
+        group = grp.getgrgid(file_stats.st_gid).gr_name
+        octal_perms = calculate_octal(file_stats.st_mode)
+
+        # Permission breakdown -------------------------------------------
+        permissions = {
+            "Owner": get_permission_bits(
+                file_stats.st_mode,
+                (stat.S_IRUSR, stat.S_IWUSR, stat.S_IXUSR),
+            ),
+            "Group": get_permission_bits(
+                file_stats.st_mode,
+                (stat.S_IRGRP, stat.S_IWGRP, stat.S_IXGRP),
+            ),
+            "Public": get_permission_bits(
+                file_stats.st_mode,
+                (stat.S_IROTH, stat.S_IWOTH, stat.S_IXOTH),
+            ),
+        }
+
+        # Special bits ---------------------------------------------------
+        special_bits = check_special_bits(file_stats.st_mode)
+
+        # Additional attributes -----------------------------------------
+        acl_status = has_acl(file_path)
+        xattr_status = has_xattr(file_path)
+        capabilities = get_capabilities(file_path)
+        immutable_status = has_immutable(file_path)
+
+        # Miscellaneous --------------------------------------------------
+        file_size = file_stats.st_size
+        link_count = file_stats.st_nlink
+        is_hidden = "Yes" if os.path.basename(file_path).startswith(".") else "No"
+        symlink_info = resolve_symlink(file_path)
+        parent_symlink_info = detect_underlying_symlink_folder(file_path)
+
+        # -------------------- Render tables ---------------------------
+
+        # Header block
+        print(f"\n=== Permissions for: '{file_path}' ===")
+
+        # Simple key/value block
+        _print_key_value_table(
+            "General Information",
+            {
+                "Type": file_type,
+                "Owner": owner,
+                "Group": group,
+                "Octal Permissions": octal_perms,
+                "File Size (bytes)": str(file_size),
+                "Link Count": str(link_count),
+                "Hidden File": is_hidden,
+                "ACLs": acl_status,
+                "Extended Attributes": xattr_status,
+                "Capabilities": capabilities,
+                "Immutable (chattr +i)": immutable_status,
+                "Symlink": symlink_info,
+                "Parent Folder Symlink": parent_symlink_info,
+            },
+        )
+
+        # Permission matrix
+        _print_permission_matrix(permissions)
+
+        # Special bits
+        _print_special_bits(special_bits)
+
+    except FileNotFoundError:
+        print(f"Error: File '{file_path}' not found.")
+    except PermissionError:
+        print(f"Error: Permission denied to access '{file_path}'.")
+
+
+# ----------------------------------------------------------------------
+# CLI entry point
+# ----------------------------------------------------------------------
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description=(
+            "chmod‑calculator – display permissions, type and attributes "
+            "of a file using a tidy tabular layout."
+        )
+    )
+    parser.add_argument("file", help="Path to the file to analyze.")
+    args = parser.parse_args()
+
+    display_permissions(args.file)
+
+
+if __name__ == "__main__":
+    main()

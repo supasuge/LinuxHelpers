@@ -1,0 +1,254 @@
+#!/usr/bin/env python3
+import sys
+import os
+import stat
+import pwd
+import grp as grp_module
+import datetime
+import subprocess
+import argparse
+import re
+from colorama import init, Fore, Style
+from tabulate import tabulate
+
+init(autoreset=True)
+
+# ---------------- Permission Helpers ----------------
+
+def octal_to_permissions(octal):
+    permissions = ['---', '--x', '-w-', '-wx', 'r--', 'r-x', 'rw-', 'rwx']
+    return ''.join(permissions[int(d)] for d in str(octal).zfill(3))
+
+
+def calculate_numeric_permissions(symbolic):
+    perm_value = {'r': 4, 'w': 2, 'x': 1, '-': 0}
+    parts = [symbolic[:3], symbolic[3:6], symbolic[6:9]]
+    return ''.join(str(sum(perm_value.get(ch, 0) for ch in part)) for part in parts)
+
+
+def explain_permissions(octal):
+    perm_string = octal_to_permissions(octal)
+    user_bits, group_bits, others_bits = perm_string[:3], perm_string[3:6], perm_string[6:9]
+
+    table = [
+        ["User",    user_bits,  "r" in user_bits,  "w" in user_bits,  "x" in user_bits],
+        ["Group",   group_bits, "r" in group_bits, "w" in group_bits, "x" in group_bits],
+        ["Others",  others_bits,"r" in others_bits,"w" in others_bits,"x" in others_bits]
+    ]
+    headers = ["Type", "Permissions", "Read", "Write", "Execute"]
+    return tabulate(table, headers=headers, tablefmt="grid")
+
+
+def print_full_permission_table():
+    table = [
+        ["0", "---", "No permission"],
+        ["1", "--x", "Execute only"],
+        ["2", "-w-", "Write only"],
+        ["3", "-wx", "Write and execute"],
+        ["4", "r--", "Read only"],
+        ["5", "r-x", "Read and execute"],
+        ["6", "rw-", "Read and write"],
+        ["7", "rwx", "Read, write, and execute"],
+    ]
+    headers = ["Octal", "Symbol", "Meaning"]
+    return tabulate(table, headers=headers, tablefmt="grid")
+
+
+def print_umask_table():
+    table = []
+    for digit in range(8):
+        removal = octal_to_permissions(digit)
+        parts = []
+        if removal[0] == 'r': parts.append('read')
+        if removal[1] == 'w': parts.append('write')
+        if removal[2] == 'x': parts.append('execute')
+        meaning = f"Remove {', '.join(parts) if parts else 'nothing'}"
+        table.append([str(digit), removal, meaning])
+    headers = ["Mask", "Removal", "Meaning"]
+    return tabulate(table, headers=headers, tablefmt="grid")
+
+
+def explain_umask(umask):
+    mask_val = int(umask, 8)
+    effective_file = 0o666 & ~mask_val
+    effective_dir  = 0o777 & ~mask_val
+    ef_octal_f = format(effective_file, '03o')
+    ef_octal_d = format(effective_dir, '03o')
+    return (
+        f"Files:       {ef_octal_f} / {octal_to_permissions(ef_octal_f)}\n"
+        f"Directories: {ef_octal_d} / {octal_to_permissions(ef_octal_d)}"
+    )
+
+
+def explain_chattr_attributes():
+    attrs = {
+        'a': 'Append only', 'c': 'Compressed', 'd': 'No dump', 'e': 'Extent format',
+        'i': 'Immutable', 'j': 'Data journalling', 's': 'Secure deletion',
+        'u': 'Undeletable', 't': 'No tail-merging', 'A': 'No atime updates',
+        'C': 'No copy-on-write', 'D': 'Synchronous directory updates',
+        'S': 'Synchronous updates', 'T': 'Top of directory hierarchy'
+    }
+    table = [[k, v] for k, v in sorted(attrs.items())]
+    headers = ["Attribute", "Description"]
+    return tabulate(table, headers=headers, tablefmt="grid")
+
+# ---------------- Path Inspection ----------------
+
+def inspect_path(path):
+    try:
+        st = os.lstat(path)
+    except (FileNotFoundError, PermissionError) as e:
+        print(Fore.RED + str(e))
+        return
+
+    mode = st.st_mode
+    if stat.S_ISDIR(mode): ftype = "Directory"
+    elif stat.S_ISLNK(mode): ftype = "Symlink"
+    elif stat.S_ISREG(mode): ftype = "File"
+    else:                  ftype = "Other"
+
+    abs_path = os.path.abspath(path)
+    size     = st.st_size
+    uid, gid = st.st_uid, st.st_gid
+    try:
+        user_name  = pwd.getpwuid(uid).pw_name
+    except KeyError:
+        user_name = str(uid)
+    try:
+        group_name = grp_module.getgrgid(gid).gr_name
+    except KeyError:
+        group_name = str(gid)
+
+    atime = datetime.datetime.fromtimestamp(st.st_atime).strftime("%Y-%m-%d %H:%M:%S")
+    mtime = datetime.datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+    ctime = datetime.datetime.fromtimestamp(st.st_ctime).strftime("%Y-%m-%d %H:%M:%S")
+
+    octal_mode = format(stat.S_IMODE(mode), '03o')
+    symbolic   = stat.filemode(mode)
+
+    perm_str = octal_to_permissions(octal_mode)
+    usr_bits, grp_bits, oth_bits = perm_str[:3], perm_str[3:6], perm_str[6:9]
+    def bits_to_list(bits):
+        mapping = [('r','read'),('w','write'),('x','execute')]
+        lst = [name for bit, name in zip(bits, [m[1] for m in mapping]) if bit != '-']
+        return lst or ['no permissions']
+    expl = (
+        f"User: {', '.join(bits_to_list(usr_bits))}"  \
+        f"; Group: {', '.join(bits_to_list(grp_bits))}"  \
+        f"; Others: {', '.join(bits_to_list(oth_bits))}"
+    )
+
+    try:
+        out = subprocess.check_output(['lsattr','-d',path], stderr=subprocess.DEVNULL, text=True)
+        flags = out.split()[0]
+    except Exception:
+        flags = None
+
+    ch_map = {
+        'a':'Append only','c':'Compressed','d':'No dump','e':'Extent format','i':'Immutable',
+        'j':'Data journalling','s':'Secure deletion','u':'Undeletable','t':'No tail-merging',
+        'A':'No atime updates','C':'No copy-on-write','D':'Synchronous directory updates',
+        'S':'Synchronous updates','T':'Top of directory hierarchy'
+    }
+    attrs_set = [ch_map[ch] for ch in (flags or '') if ch in ch_map]
+
+    print(Fore.CYAN + Style.BRIGHT + "\n=== File/Directory Information ===")
+    
+    def kv(label, val): 
+        print(Fore.GREEN + f"{label:<12}" + Style.RESET_ALL + str(val))
+
+    kv("Path:",        abs_path)
+    kv("Type:",        ftype)
+    kv("Size:",        f"{size} bytes")
+    kv("Owner:",       f"{uid} ({user_name})")
+    kv("Group:",       f"{gid} ({group_name})")
+    kv("Accessed:",    atime)
+    kv("Modified:",    mtime)
+    kv("Changed:",     ctime)
+    kv("Permissions:", f"{octal_mode} / {symbolic} ({expl})")
+
+    if flags is not None:
+        kv("chattr flags:", flags or '(none)')
+        if attrs_set:
+            print(Fore.GREEN + " Attributes:")
+            for d in attrs_set: print("   - " + d)
+        else:
+            print(Fore.GREEN + " No special chattr attributes set")
+    else:
+        print(Fore.YELLOW + "lsattr not found; skipping chattr info.")
+
+# ---------------- Main ----------------
+
+def main():
+    parser = argparse.ArgumentParser(description="Enhanced Linux Permissions & File Info Utility")
+    parser.add_argument("permissions", nargs='?', default=None,
+                        help="Octal (e.g. 755) or symbolic (e.g. rwxr-xr-x) permission")
+    parser.add_argument("-u", "--umask", metavar="UMASK",
+                        help="Explain umask (e.g. 022)")
+    parser.add_argument("-c", "--chattr", action="store_true",
+                        help="Show chattr attributes table")
+    parser.add_argument("-i", "--path", metavar="PATH",
+                        help="Inspect file/directory metadata & chattr")
+    parser.add_argument("--reference", action="store_true",
+                        help="Show reference tables for chmod, umask, chattr with examples")
+
+    args = parser.parse_args()
+
+    if args.reference:
+        print(Fore.CYAN + Style.BRIGHT + "\n=== chmod Permission Table ===")
+        print(Style.BRIGHT + print_full_permission_table())
+        print(Fore.CYAN + Style.BRIGHT + "\nExample Usage:")
+        print(Style.BRIGHT + "chmod 600 ~/.ssh/id_rsa   # private key readable/writable by owner only")
+        print(Style.BRIGHT + "chmod 700 ~/.ssh          # .ssh directory accessible only by owner")
+
+        print(Fore.CYAN + Style.BRIGHT + "\n=== umask Removal Table ===")
+        print(Style.BRIGHT + print_umask_table())
+
+        print(Fore.CYAN + Style.BRIGHT + "\n=== chattr Attributes ===")
+        print(Style.BRIGHT + explain_chattr_attributes())
+        sys.exit(0)
+
+    if args.path and not args.permissions:
+        inspect_path(args.path)
+        sys.exit(0)
+
+    if args.umask and not args.permissions:
+        print(Fore.CYAN + Style.BRIGHT + "\n=== Umask Explanation ===")
+        print(Style.BRIGHT + explain_umask(args.umask))
+        sys.exit(0)
+
+    if args.chattr and not args.permissions:
+        print(Fore.CYAN + Style.BRIGHT + "\n=== chattr Attributes ===")
+        print(Style.BRIGHT + explain_chattr_attributes())
+        sys.exit(0)
+
+    if not args.permissions:
+        parser.print_help()
+        sys.exit(1)
+
+    perm_arg = args.permissions
+    if perm_arg.isdigit() and re.fullmatch(r"[0-7]{3}", perm_arg):
+        octal = perm_arg
+    else:
+        octal = calculate_numeric_permissions(perm_arg)
+
+    print(Fore.CYAN + Style.BRIGHT + "\n=== Permissions Explanation ===")
+    print(Style.BRIGHT + explain_permissions(octal))
+
+    print(Fore.CYAN + Style.BRIGHT + "\n=== Representations ===")
+    print(Fore.GREEN + "Numeric:  " + Style.RESET_ALL + octal)
+    print(Fore.GREEN + "Symbolic: " + Style.RESET_ALL + octal_to_permissions(octal))
+
+    if args.umask:
+        print(Fore.CYAN + Style.BRIGHT + "\n=== Umask Explanation ===")
+        print(Style.BRIGHT + explain_umask(args.umask))
+
+    if args.chattr:
+        print(Fore.CYAN + Style.BRIGHT + "\n=== chattr Attributes ===")
+        print(Style.BRIGHT + explain_chattr_attributes())
+
+    print(Fore.CYAN + Style.BRIGHT + "\n=== Full Linux Permission Table ===")
+    print(Style.BRIGHT + print_full_permission_table())
+
+if __name__ == "__main__":
+    main()
