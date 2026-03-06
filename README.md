@@ -2,6 +2,12 @@
 
 Useful Python3 scripts for getting  a quick reference of file/directory permissions for mainly begineers but also just generally useful.
 
+If you choose to use any of these scripts, it's reccomended you place them with your local `$PATH` such as `/usr/local/bin/`
+
+## permhelp.py
+
+Similar to `perms` except quite a bit more comprehensive as far as showcasing examples.
+
 ## perms
 
 Help menu:
