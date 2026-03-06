@@ -1,0 +1,130 @@
+#!/usr/bin/env bash
+# ============================================================
+# archiver — Secure directory archiver: tar → gzip → lz4
+# ============================================================
+
+set -Eeuo pipefail
+IFS=$'\n\t'
+
+# ------------------------------------------------------------
+# ANSI + Logging
+# ------------------------------------------------------------
+ESC='\033'
+RESET="${ESC}[0m"
+BOLD="${ESC}[1m"
+DIM="${ESC}[2m"
+
+FG_RED="${ESC}[31m"
+FG_GREEN="${ESC}[32m"
+FG_YELLOW="${ESC}[33m"
+FG_BLUE="${ESC}[34m"
+FG_MAGENTA="${ESC}[35m"
+FG_CYAN="${ESC}[36m"
+
+info()    { echo -e "${FG_BLUE}[INFO]${RESET} $*"; }
+warn()    { echo -e "${FG_YELLOW}[WARN]${RESET} $*"; }
+success() { echo -e "${FG_GREEN}${BOLD}[OK]${RESET} $*"; }
+error()   { echo -e "${FG_RED}${BOLD}[ERROR]${RESET} $*" >&2; }
+fatal()   { error "$*"; exit 1; }
+
+step() {
+    echo -e "${FG_MAGENTA}${BOLD}▶${RESET} $*"
+}
+
+# ------------------------------------------------------------
+# Timing
+# ------------------------------------------------------------
+START_TIME=$(date +%s)
+elapsed() { echo "$(( $(date +%s) - START_TIME ))s"; }
+
+# ------------------------------------------------------------
+# Helpers
+# ------------------------------------------------------------
+require_cmd() {
+    command -v "$1" >/dev/null 2>&1 || fatal "Missing dependency: $1"
+}
+
+human_size() {
+    du -sh "$1" | awk '{print $1}'
+}
+
+# ------------------------------------------------------------
+# Usage
+# ------------------------------------------------------------
+usage() {
+    cat <<EOF
+Usage:
+  archiver --archive <directory>
+  archiver --unarchive <file.tar.gz.lz4>
+EOF
+    exit 1
+}
+
+# ------------------------------------------------------------
+# Archive
+# ------------------------------------------------------------
+archive_directory() {
+    local dir="$1"
+    [ -d "$dir" ] || fatal "Not a directory: $dir"
+
+    require_cmd tar
+    require_cmd gzip
+    require_cmd lz4
+    require_cmd du
+
+    local tar_file="${dir}.tar"
+    local gz_file="${tar_file}.gz"
+    local lz4_file="${gz_file}.lz4"
+
+    step "Archiving $dir"
+    info "Original size: $(human_size "$dir")"
+
+    tar -cf "$tar_file" "$dir"
+    info "Tar size: $(human_size "$tar_file")"
+
+    gzip "$tar_file"
+    info "Gzip size: $(human_size "$gz_file")"
+
+    lz4 "$gz_file" "$lz4_file" >/dev/null
+    rm -f "$gz_file"
+
+    success "Archive created: $lz4_file"
+    success "Completed in $(elapsed)"
+}
+
+# ------------------------------------------------------------
+# Unarchive
+# ------------------------------------------------------------
+unarchive_file() {
+    local file="$1"
+    [ -f "$file" ] || fatal "Archive not found: $file"
+
+    require_cmd tar
+    require_cmd gzip
+    require_cmd lz4
+
+    local gz_file="${file%.lz4}"
+    local tar_file="${gz_file%.gz}"
+
+    step "Extracting $file"
+    lz4 -d "$file" "$gz_file" >/dev/null
+    gunzip "$gz_file"
+    tar -xf "$tar_file"
+    rm -f "$tar_file"
+
+    success "Unarchive complete"
+    success "Completed in $(elapsed)"
+}
+
+# ------------------------------------------------------------
+# Main
+# ------------------------------------------------------------
+[ $# -eq 2 ] || usage
+
+case "$1" in
+    --archive)   archive_directory "$2" ;;
+    --unarchive) unarchive_file "$2" ;;
+    --help) usage ;;
+    *) usage ;;
+esac
+
